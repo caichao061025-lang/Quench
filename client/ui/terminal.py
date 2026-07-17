@@ -125,8 +125,14 @@ class TerminalPanel:
                     self._w('[%.2fs]\n' % r.get('_elapsed', 0), 'dim')
         except queue.Empty:
             pass
+        except tk.TclError:
+            # 窗口已销毁，停止调度
+            return
         if self._running:
-            self.frame.after(200, self._process)
+            try:
+                self.frame.after(200, self._process)
+            except tk.TclError:
+                pass  # 窗口已销毁
 
     def _on_up(self, e):
         if not self.history: return

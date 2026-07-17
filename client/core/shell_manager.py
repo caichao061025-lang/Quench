@@ -68,13 +68,17 @@ class ShellManager:
             self.shells = []
 
     def _save(self):
-        """保存配置到 JSON 文件"""
+        """保存配置到 JSON 文件（不抛异常）"""
         data = {'shells': [s.to_dict() for s in self.shells]}
-        dirname = os.path.dirname(self.config_file)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            dirname = os.path.dirname(self.config_file)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            # 权限不足或磁盘满时静默忽略，shell 仍在内存中可用
+            pass
 
     def add(self, config: ShellConfig):
         """添加一个 Shell 配置"""

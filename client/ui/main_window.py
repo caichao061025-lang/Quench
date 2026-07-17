@@ -10,7 +10,7 @@ from core.connector import Connector
 from ui.file_manager import FileManagerPanel
 from ui.terminal import TerminalPanel
 from ui.database import DatabasePanel
-from ui.theme import BG, CARD, BORDER, ACCENT, ACCENT_L, SUCCESS, DANGER, TEXT, TEXT2, INPUT_BG, FONT
+from ui.theme import BG, CARD, BORDER, ACCENT, ACCENT_L, SUCCESS, WARN, DANGER, TEXT, TEXT2, INPUT_BG, FONT
 
 
 class MainWindow:
@@ -24,6 +24,7 @@ class MainWindow:
         self.shell_manager = ShellManager()
         self.connector = None
         self.current_shell_index = -1
+        self._shell_alive = {}    # index -> bool, 跟踪每个 shell 是否存活
 
         self._build()
         self._refresh_shell_list()
@@ -160,6 +161,11 @@ class MainWindow:
         self.shell_listbox.delete(0, tk.END)
         for i, s in enumerate(self.shell_manager.get_all()):
             m = '  ●  ' if i == self.current_shell_index else '     '
+            # 状态标记：绿 ● 存活，红 ● 失效， 未检测
+            if i == self.current_shell_index and i in self._shell_alive:
+                m = '  ●  ' if self._shell_alive[i] else '  ✕  '
+            elif i == self.current_shell_index:
+                m = '  ◌  '   # 正在检测中
             self.shell_listbox.insert(tk.END, m + s.name)
         n = self.shell_manager.count()
         self.sidebar_count.config(text=f'{n} 个 Shell' if n else '未配置 Shell')
@@ -172,9 +178,17 @@ class MainWindow:
         self.current_shell_index = idx
         s = self.shell_manager.get(idx)
         self.connector = Connector(s.url, s.password)
-        self.status_label.config(text=f'已连接: {s.name}  ·  {s.url}')
-        self._set_status_dot('on')
         self._refresh_shell_list()
+
+        # 如果已知该 shell 已失效，直接显示错误，不再尝试连接
+        if idx in self._shell_alive and not self._shell_alive[idx]:
+            self._clear_all_panels()
+            self.status_label.config(text=f'已失效: {s.name}  ·  {s.url}')
+            self._set_status_dot('off')
+            return
+
+        self.status_label.config(text=f'连接中: {s.name}  ·  {s.url}')
+        self._set_status_dot('busy')
         self._init_panels()
 
     # ═══════ Shell 对话框 ═══════
@@ -189,19 +203,24 @@ class MainWindow:
 
     def _on_dialog_done(self, mode, cfg):
         if cfg is None: return
-        if mode == 'add':
-            self.shell_manager.add(cfg)
-            self._refresh_shell_list()
-            idx = self.shell_manager.count() - 1
-            self.shell_listbox.selection_clear(0, tk.END)
-            self.shell_listbox.selection_set(idx)
-            self.shell_listbox.see(idx)
-            self._on_shell_select(None)
-        else:
-            self.shell_manager.update(self.current_shell_index, cfg)
-            self.connector = Connector(cfg.url, cfg.password)
-            self._refresh_shell_list()
-            self._init_panels()
+        try:
+            if mode == 'add':
+                self.shell_manager.add(cfg)
+                self._refresh_shell_list()
+                idx = self.shell_manager.count() - 1
+                self.shell_listbox.selection_clear(0, tk.END)
+                self.shell_listbox.selection_set(idx)
+                self.shell_listbox.see(idx)
+                # selection_set 不触发 <<ListboxSelect>>，必须显式调用
+                self._on_shell_select(None)
+            else:
+                self.shell_manager.update(self.current_shell_index, cfg)
+                self._shell_alive.pop(self.current_shell_index, None)
+                self.connector = Connector(cfg.url, cfg.password)
+                self._refresh_shell_list()
+                self._init_panels()
+        except Exception as e:
+            messagebox.showerror('错误', f'操作失败: {e}', parent=self.root)
 
     def _delete_shell(self):
         if self.current_shell_index < 0:
@@ -209,7 +228,16 @@ class MainWindow:
         s = self.shell_manager.get(self.current_shell_index)
         ok = messagebox.askyesno('确认删除', f'删除 "{s.name}"？', parent=self.root)
         if not ok: return
-        self.shell_manager.remove(self.current_shell_index)
+        removed_idx = self.current_shell_index
+        self.shell_manager.remove(removed_idx)
+        # 重建 _shell_alive 索引
+        new_alive = {}
+        for idx, alive in self._shell_alive.items():
+            if idx > removed_idx:
+                new_alive[idx - 1] = alive
+            elif idx < removed_idx:
+                new_alive[idx] = alive
+        self._shell_alive = new_alive
         self.current_shell_index = -1
         self.connector = None
         self._refresh_shell_list()
@@ -229,22 +257,52 @@ class MainWindow:
         self.root.after(0, lambda: self._on_ping(r))
 
     def _on_ping(self, r):
+        idx = self.current_shell_index
         if 'pong' in r:
+            self._shell_alive[idx] = True
             messagebox.showinfo('连接成功', 'Webshell 响应正常\n服务器时间: ' + r.get('time', ''), parent=self.root)
             self._set_status_dot('on')
         else:
+            self._shell_alive[idx] = False
             messagebox.showerror('连接失败', r.get('error', '未知错误'), parent=self.root)
             self._set_status_dot('off')
+        self._refresh_shell_list()
 
     # ═══════ 面板管理 ═══════
     def _init_panels(self):
+        """初始化面板（异步，不阻塞 UI）"""
         if not self.connector: return
         self.terminal_panel.clear()
-        info = self.connector.get_info()
-        cwd = info.get('cwd', '.') if 'error' not in info else '.'
+        self.file_panel.clear()
+        self.file_panel.current_path = '.'
+        self.file_panel.path_var.set('.')
+        connector = self.connector
+        threading.Thread(target=self._do_init, args=(connector,), daemon=True).start()
+
+    def _do_init(self, connector):
+        info = connector.get_info()
+        self.root.after(0, self._on_init, connector, info)
+
+    def _on_init(self, connector, info):
+        # 如果用户在此期间切换了其他 Shell，忽略此次结果
+        if connector is not self.connector:
+            return
+        idx = self.current_shell_index
+        if 'error' in info:
+            self._shell_alive[idx] = False
+            self.status_label.config(text='连接失败: %s' % info.get('error', '未知'))
+            self._set_status_dot('off')
+            self._refresh_shell_list()
+            return
+        self._shell_alive[idx] = True
+        cwd = info.get('cwd', '.')
         self.file_panel.current_path = cwd
         self.file_panel.path_var.set(cwd)
         self.file_panel.refresh(cwd)
+        self._set_status_dot('on')
+        s = self.shell_manager.get(idx)
+        self.status_label.config(text=f'已连接: {s.name}  ·  {s.url}')
+        self._refresh_shell_list()
 
     def _clear_all_panels(self):
         self.file_panel.clear()
@@ -258,8 +316,15 @@ class MainWindow:
         messagebox.showinfo('关于', '淬火 Quench\nWebshell 管理工具\n\n仅用于授权安全测试', parent=self.root)
 
     def _on_close(self):
-        if messagebox.askokcancel('退出', '确定退出？', parent=self.root):
-            self.root.destroy()
+        if not messagebox.askokcancel('退出', '确定退出？', parent=self.root):
+            return
+        # 停止终端轮询循环，避免 destroy 后 after 仍在调度导致无法退出
+        try:
+            self.terminal_panel._running = False
+        except Exception:
+            pass
+        self.root.quit()
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
@@ -270,70 +335,90 @@ class ShellEditDialog(tk.Toplevel):
     def __init__(self, parent, title='添加 Shell', config=None, callback=None):
         super().__init__(parent)
         self.title(title)
-        self.result = None
         self.cb = callback
+        self._finished = False        # 防重复触发
         self.configure(bg=CARD)
         self.resizable(False, False)
         self.transient(parent)
-        self.geometry('460x320')
-
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        self.geometry('+%d+%d' % (px + (pw-460)//2, py + (ph-320)//2))
 
         self._build(config)
+
+        # 居中
+        self.update_idletasks()
+        w, h = 460, 380
+        px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        self.geometry('%dx%d+%d+%d' % (w, h, max(px, 0), max(py, 0)))
+
+        self.protocol('WM_DELETE_WINDOW', self._cancel)
+        self.bind('<Escape>', lambda e: self._cancel())
+
         self.lift()
         self.focus_force()
-        self.grab_set()
-        self.wait_window()
+        # grab 延后，确保窗口就绪；保存 after ID 以便关闭时取消
+        self._grab_after_id = self.after(50, lambda: self._safe(lambda: self.grab_set()))
+
+    def _safe(self, fn):
+        try:
+            fn()
+        except Exception:
+            pass
 
     def _build(self, cfg):
-        f = tk.Frame(self, bg=CARD, padx=24, pady=20)
+        f = tk.Frame(self, bg=CARD, padx=20, pady=16)
         f.pack(fill=tk.BOTH, expand=True)
 
         title_text = '添加 Shell' if cfg is None else '编辑 Shell'
         tk.Label(f, text=title_text, bg=CARD, fg=TEXT,
-                 font=(FONT, 14, 'bold')).pack(anchor='w', pady=(0, 16))
+                 font=(FONT, 14, 'bold')).pack(anchor='w', pady=(0, 12))
 
-        for label, var_name, default, show in [
-            ('名称', 'name', '靶机-1', None),
-            ('URL', 'url', 'http://', None),
-            ('密码', 'password', 'test', '●'),
-            ('备注', 'note', '', None),
+        for label, var_name, default in [
+            ('名称', 'name', '靶机-1'),
+            ('URL',   'url',  'http://'),
+            ('密码', 'password', 'test'),
+            ('备注', 'note', ''),
         ]:
-            tk.Label(f, text=label, bg=CARD, fg=TEXT2,
-                     font=(FONT, 9)).pack(anchor='w', pady=(6, 2))
+            row = tk.Frame(f, bg=CARD)
+            row.pack(fill=tk.X, pady=(6, 0))
 
-            fr = tk.Frame(f, bg=INPUT_BG, highlightbackground=BORDER,
-                          highlightthickness=1)
-            fr.pack(fill=tk.X)
+            tk.Label(row, text=label, bg=CARD, fg=TEXT2,
+                     font=(FONT, 9), width=5, anchor='w').pack(side=tk.LEFT)
 
             val = cfg.__getattribute__(var_name) if cfg else default
             v = tk.StringVar(value=val)
-            e = tk.Entry(fr, textvariable=v, font=(FONT, 10),
+            show_char = '●' if var_name == 'password' else ''
+            e = tk.Entry(row, textvariable=v, font=(FONT, 10),
                          bg=INPUT_BG, fg=TEXT, insertbackground=TEXT,
-                         relief='flat', borderwidth=0,
-                         show='●' if (show and var_name == 'password') else '')
-            e.pack(fill=tk.X, expand=True, ipady=6, padx=8)
-
+                         relief='solid', borderwidth=1,
+                         show=show_char)
+            e.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(4, 0))
+            e.bind('<Return>', lambda e, dlg=self: dlg._ok())
             setattr(self, '_%s' % var_name, v)
-            if show and var_name == 'password':
-                setattr(self, '_pw_entry', e)
+            setattr(self, '_entry_%s' % var_name, e)
 
-        # 显示密码
-        self._show_pw = tk.BooleanVar(value=False)
-        pw_row = [w for w in f.winfo_children()
-                  if isinstance(w, tk.Label) and w.cget('text') == '密码'][0]
-        # 用简单的方式: 直接在密码框frame后放checkbox
-        # skip the complexity, just toggle
-
-        # 按钮
+        # 按钮区
         bf = tk.Frame(f, bg=CARD)
-        bf.pack(fill=tk.X, pady=(18, 0))
-        ttk.Button(bf, text='取消', command=self._cancel).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text='保存', command=self._ok, style='Primary.TButton').pack(side=tk.RIGHT)
+        bf.pack(fill=tk.X, pady=(20, 0))
+
+        btn_cancel = tk.Button(bf, text='取消', command=self._cancel,
+                               font=(FONT, 10), bg=CARD, fg=TEXT2,
+                               relief='flat', padx=16, pady=6,
+                               activebackground='#e8ecf0', activeforeground=TEXT,
+                               borderwidth=1)
+        btn_cancel.pack(side=tk.RIGHT, padx=(6, 0))
+
+        btn_ok = tk.Button(bf, text='确定', command=self._ok,
+                           font=(FONT, 10, 'bold'), bg=ACCENT, fg='#ffffff',
+                           relief='flat', padx=20, pady=6,
+                           activebackground='#0969da', activeforeground='#ffffff',
+                           borderwidth=0)
+        btn_ok.pack(side=tk.RIGHT)
+        # 把焦点放到第一个输入框
+        self._entry_name.focus_set()
 
     def _ok(self):
+        if self._finished:
+            return
         n = self._name.get().strip()
         u = self._url.get().strip()
         p = self._password.get().strip()
@@ -341,10 +426,31 @@ class ShellEditDialog(tk.Toplevel):
         if not n or not u or not p:
             messagebox.showwarning('提示', '名称、URL、密码不能为空', parent=self)
             return
-        self.result = ShellConfig(name=n, url=u, password=p, note=nt)
-        self.grab_release()
-        self.destroy()
+        self._finish(ShellConfig(name=n, url=u, password=p, note=nt))
 
     def _cancel(self):
-        self.grab_release()
-        self.destroy()
+        if self._finished:
+            return
+        self._finish(None)
+
+    def _finish(self, result):
+        self._finished = True
+        # 取消延后的 grab_set，避免在已销毁的窗口上设置 grab
+        if hasattr(self, '_grab_after_id') and self._grab_after_id:
+            try:
+                self.after_cancel(self._grab_after_id)
+            except Exception:
+                pass
+            self._grab_after_id = None
+        self._safe(lambda: self.grab_release())
+        cb = self.cb
+        self.cb = None
+        if cb:
+            try:
+                cb(result)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                messagebox.showerror('错误', f'操作失败: {e}', parent=self.master)
+        # destroy 放在 after 中，确保当前事件处理完毕
+        self.after(10, self.destroy)

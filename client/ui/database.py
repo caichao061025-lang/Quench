@@ -4,7 +4,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
-from ui.theme import (BG, CARD, BORDER, ACCENT, ACCENT_L, SUCCESS, DANGER,
+from ui.theme import (BG, CARD, BORDER, ACCENT, ACCENT_L, SUCCESS, WARN, DANGER,
                       TEXT, TEXT2, INPUT_BG, FONT, make_text)
 
 
